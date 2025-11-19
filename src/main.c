@@ -23,9 +23,10 @@
 #define MOUSE_SENS           0.0020f // Radians per pixel
 
 #define SCARY_CHAR_COUNT     3       // Number of scary characters
-#define SCARY_CHAR_SPEED     3.5f    // Scary character movement speed (slightly slower than player)
+#define SCARY_CHAR_SPEED     2.8f    // Scary character movement speed (slower than player for winnable gameplay)
 #define SCARY_CHAR_RADIUS    0.35f   // Collision radius
 #define SCARY_CHAR_HEIGHT    2.2f    // Height of scary character
+#define SCARY_CHAR_RANDOMNESS 0.15f  // Randomness factor in movement (0.0 = perfect chase, higher = more random)
 
 #define BEST_RECORD_FILE     "best_record.txt"  // File to store best record
 
@@ -165,35 +166,83 @@ static void InitGame(Maze** maze, WallRect** walls, int* wallCount, Vector3* pla
     playerPos->y = 0.0f;
     playerPos->z = startWorld.y;
     
-    // Initialize scary characters at different positions (spread out from exit and corners)
+    // Initialize scary characters at random positions (far from player)
     if (scaryChars && scaryCharCount > 0) {
-        // First character at exit
-        Vector2 exitWorld = Maze_CellToWorld(*maze, (int)(*maze)->exitPos.x, (int)(*maze)->exitPos.y);
-        scaryChars[0].position = (Vector3){exitWorld.x, 0.0f, exitWorld.y};
-        scaryChars[0].speed = SCARY_CHAR_SPEED;
-        scaryChars[0].radius = SCARY_CHAR_RADIUS;
-        scaryChars[0].height = SCARY_CHAR_HEIGHT;
+        // Get player start position in world coordinates
+        Vector2 playerStartWorld = Maze_CellToWorld(*maze, (int)(*maze)->startPos.x, (int)(*maze)->startPos.y);
         
-        // Second character at top-right corner (if exists)
-        if (scaryCharCount > 1) {
-            int cornerX = (*maze)->width - 1;
-            int cornerY = 0;
-            Vector2 cornerWorld = Maze_CellToWorld(*maze, cornerX, cornerY);
-            scaryChars[1].position = (Vector3){cornerWorld.x, 0.0f, cornerWorld.y};
-            scaryChars[1].speed = SCARY_CHAR_SPEED;
-            scaryChars[1].radius = SCARY_CHAR_RADIUS;
-            scaryChars[1].height = SCARY_CHAR_HEIGHT;
-        }
+        // Minimum distance from player (in world units) - about 8-10 cells away for better chance to win
+        const float MIN_DISTANCE_FROM_PLAYER = 30.0f;
         
-        // Third character at bottom-left corner (if exists)
-        if (scaryCharCount > 2) {
-            int cornerX = 0;
-            int cornerY = (*maze)->height - 1;
-            Vector2 cornerWorld = Maze_CellToWorld(*maze, cornerX, cornerY);
-            scaryChars[2].position = (Vector3){cornerWorld.x, 0.0f, cornerWorld.y};
-            scaryChars[2].speed = SCARY_CHAR_SPEED;
-            scaryChars[2].radius = SCARY_CHAR_RADIUS;
-            scaryChars[2].height = SCARY_CHAR_HEIGHT;
+        for (int i = 0; i < scaryCharCount; i++) {
+            // Try to find a valid random position (not at start or exit, and far from player)
+            int attempts = 0;
+            int cellX, cellY;
+            bool validPos = false;
+            
+            while (!validPos && attempts < 200) {
+                // Generate random cell coordinates
+                cellX = rand() % (*maze)->width;
+                cellY = rand() % (*maze)->height;
+                
+                // Check if position is not at start or exit
+                bool isStart = (cellX == (int)(*maze)->startPos.x && cellY == (int)(*maze)->startPos.y);
+                bool isExit = (cellX == (int)(*maze)->exitPos.x && cellY == (int)(*maze)->exitPos.y);
+                
+                // Check if this position is already used by another scary character
+                bool isDuplicate = false;
+                for (int j = 0; j < i; j++) {
+                    int existingCellX, existingCellY;
+                    Maze_WorldToCell(*maze, scaryChars[j].position.x, scaryChars[j].position.z, &existingCellX, &existingCellY);
+                    if (cellX == existingCellX && cellY == existingCellY) {
+                        isDuplicate = true;
+                        break;
+                    }
+                }
+                
+                // Check distance from player start position
+                Vector2 charWorldPos = Maze_CellToWorld(*maze, cellX, cellY);
+                float dx = charWorldPos.x - playerStartWorld.x;
+                float dz = charWorldPos.y - playerStartWorld.y;
+                float distFromPlayer = sqrtf(dx * dx + dz * dz);
+                bool isFarEnough = (distFromPlayer >= MIN_DISTANCE_FROM_PLAYER);
+                
+                if (!isStart && !isExit && !isDuplicate && isFarEnough) {
+                    validPos = true;
+                }
+                attempts++;
+            }
+            
+            // If we couldn't find a valid position after many attempts, use any random position
+            // (but still try to be far from player)
+            if (!validPos) {
+                // Try a few more times with slightly relaxed distance
+                const float RELAXED_DISTANCE = 25.0f;
+                for (int retry = 0; retry < 50; retry++) {
+                    cellX = rand() % (*maze)->width;
+                    cellY = rand() % (*maze)->height;
+                    Vector2 charWorldPos = Maze_CellToWorld(*maze, cellX, cellY);
+                    float dx = charWorldPos.x - playerStartWorld.x;
+                    float dz = charWorldPos.y - playerStartWorld.y;
+                    float distFromPlayer = sqrtf(dx * dx + dz * dz);
+                    if (distFromPlayer >= RELAXED_DISTANCE) {
+                        validPos = true;
+                        break;
+                    }
+                }
+                // Last resort: just use any random position
+                if (!validPos) {
+                    cellX = rand() % (*maze)->width;
+                    cellY = rand() % (*maze)->height;
+                }
+            }
+            
+            // Convert cell coordinates to world position
+            Vector2 worldPos = Maze_CellToWorld(*maze, cellX, cellY);
+            scaryChars[i].position = (Vector3){worldPos.x, 0.0f, worldPos.y};
+            scaryChars[i].speed = SCARY_CHAR_SPEED;
+            scaryChars[i].radius = SCARY_CHAR_RADIUS;
+            scaryChars[i].height = SCARY_CHAR_HEIGHT;
         }
     }
     
@@ -552,6 +601,25 @@ int main(void) {
                     if (dist > 0.001f) {
                         dir.x /= dist;
                         dir.y /= dist;
+                        
+                        // Add randomness to movement direction (makes them less perfect at chasing)
+                        // This gives player a better chance to escape
+                        float randomAngle = ((float)rand() / (float)RAND_MAX) * 2.0f * 3.14159265359f * SCARY_CHAR_RANDOMNESS;
+                        float cosAngle = cosf(randomAngle);
+                        float sinAngle = sinf(randomAngle);
+                        Vector2 randomDir = (Vector2){
+                            dir.x * cosAngle - dir.y * sinAngle,
+                            dir.x * sinAngle + dir.y * cosAngle
+                        };
+                        // Blend between perfect direction and random direction
+                        dir.x = dir.x * (1.0f - SCARY_CHAR_RANDOMNESS) + randomDir.x * SCARY_CHAR_RANDOMNESS;
+                        dir.y = dir.y * (1.0f - SCARY_CHAR_RANDOMNESS) + randomDir.y * SCARY_CHAR_RANDOMNESS;
+                        // Renormalize
+                        float dirLen = sqrtf(dir.x * dir.x + dir.y * dir.y);
+                        if (dirLen > 0.001f) {
+                            dir.x /= dirLen;
+                            dir.y /= dirLen;
+                        }
                         
                         // Move towards player with collision detection
                         Vector2 moveStep = (Vector2){
