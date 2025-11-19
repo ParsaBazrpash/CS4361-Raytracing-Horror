@@ -7,7 +7,8 @@ cc = meson.get_compiler('c')
 # Source files
 sources = [
   'src/main.c',
-  'src/maze.c'
+  'src/maze.c',
+  'src/assets.c'
 ]
 
 # Include directory

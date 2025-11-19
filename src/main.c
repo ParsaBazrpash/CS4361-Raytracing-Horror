@@ -1,5 +1,6 @@
 #include "raylib.h"
 #include "../include/maze.h"
+#include "../include/assets.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -50,7 +51,8 @@ static bool CollidesAny(Vector2 c, float r, const WallRect* walls, int count) {
 
 // Initialize game (generate maze, reset player)
 static void InitGame(Maze** maze, WallRect** walls, int* wallCount, Vector3* playerPos, 
-                     float* yaw, float* pitch, GameState* gameState) {
+                     float* yaw, float* pitch, GameState* gameState,
+                     Torch** torches, int* torchCount, ParticleSystem*** particleSystems) {
     // Free old maze if exists
     if (*maze) {
         Maze_Destroy(*maze);
@@ -59,6 +61,19 @@ static void InitGame(Maze** maze, WallRect** walls, int* wallCount, Vector3* pla
     if (*walls) {
         free(*walls);
         *walls = NULL;
+    }
+    if (*torches) {
+        free(*torches);
+        *torches = NULL;
+    }
+    if (*particleSystems) {
+        for (int i = 0; i < *torchCount; i++) {
+            if ((*particleSystems)[i]) {
+                ParticleSystem_Destroy((*particleSystems)[i]);
+            }
+        }
+        free(*particleSystems);
+        *particleSystems = NULL;
     }
     
     // Create and generate new maze
@@ -80,6 +95,20 @@ static void InitGame(Maze** maze, WallRect** walls, int* wallCount, Vector3* pla
     
     *wallCount = Maze_GetWallRects(*maze, *walls, maxWalls);
     
+    // Generate torches (reduced limit for better performance)
+    int maxTorches = 100; // Reduced from 200 for better performance
+    *torchCount = Torches_Generate(*maze, torches, maxTorches);
+    
+    // Create particle systems for each torch
+    if (*torchCount > 0) {
+        *particleSystems = (ParticleSystem**)malloc(*torchCount * sizeof(ParticleSystem*));
+        if (*particleSystems) {
+            for (int i = 0; i < *torchCount; i++) {
+                (*particleSystems)[i] = ParticleSystem_Create(20); // Reduced to 20 particles per torch for performance
+            }
+        }
+    }
+    
     // Reset player to start position
     Vector2 startWorld = Maze_CellToWorld(*maze, (int)(*maze)->startPos.x, (int)(*maze)->startPos.y);
     playerPos->x = startWorld.x;
@@ -91,29 +120,98 @@ static void InitGame(Maze** maze, WallRect** walls, int* wallCount, Vector3* pla
     *gameState = GAME_STATE_PLAYING;
 }
 
-// Render the maze in 3D
-static void RenderMaze(const Maze* maze) {
-    if (!maze) return;
+// Static cube model for textured rendering
+static Model s_cubeModel = {0};
+static bool s_cubeModelCreated = false;
+
+// Helper: Get or create cube model
+static Model* GetCubeModel(void) {
+    if (!s_cubeModelCreated) {
+        Mesh cubeMesh = GenMeshCube(1.0f, 1.0f, 1.0f);
+        s_cubeModel = LoadModelFromMesh(cubeMesh);
+        s_cubeModelCreated = true;
+    }
+    return &s_cubeModel;
+}
+
+// Cleanup cube model
+static void CleanupCubeModel(void) {
+    if (s_cubeModelCreated && s_cubeModel.meshCount > 0) {
+        UnloadModel(s_cubeModel);
+        s_cubeModel.meshCount = 0;
+        s_cubeModelCreated = false;
+    }
+}
+
+// Optimized: Batch texture changes
+static Texture2D s_currentCubeTexture = {0};
+static void DrawTexturedCube(Vector3 position, Vector3 size, Texture2D texture) {
+    Model* cubeModel = GetCubeModel();
+    
+    // Only update texture if it changed (batching optimization)
+    if (s_currentCubeTexture.id != texture.id) {
+        cubeModel->materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+        s_currentCubeTexture = texture;
+    }
+    
+    // Draw scaled and positioned
+    DrawModelEx(*cubeModel, position, (Vector3){0, 1, 0}, 0.0f, size, WHITE);
+}
+
+// Static plane model for textured rendering
+static Model s_planeModel = {0};
+static bool s_planeModelCreated = false;
+
+static Model* GetPlaneModel(void) {
+    if (!s_planeModelCreated) {
+        Mesh planeMesh = GenMeshPlane(1.0f, 1.0f, 1, 1);
+        s_planeModel = LoadModelFromMesh(planeMesh);
+        s_planeModelCreated = true;
+    }
+    return &s_planeModel;
+}
+
+// Optimized: Batch texture changes
+static Texture2D s_currentPlaneTexture = {0};
+static void DrawTexturedPlane(Vector3 position, Vector2 size, Texture2D texture) {
+    Model* planeModel = GetPlaneModel();
+    
+    // Only update texture if it changed (batching optimization)
+    if (s_currentPlaneTexture.id != texture.id) {
+        planeModel->materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+        s_currentPlaneTexture = texture;
+    }
+    
+    // Draw scaled and positioned
+    DrawModelEx(*planeModel, position, (Vector3){0, 1, 0}, 0.0f, (Vector3){size.x, 1.0f, size.y}, WHITE);
+}
+
+static void CleanupPlaneModel(void) {
+    if (s_planeModelCreated && s_planeModel.meshCount > 0) {
+        UnloadModel(s_planeModel);
+        s_planeModel.meshCount = 0;
+        s_planeModelCreated = false;
+    }
+}
+
+// Render the maze in 3D with textures
+static void RenderMaze(const Maze* maze, const GameAssets* assets) {
+    if (!maze || !assets || !assets->loaded) return;
     
     const float halfCell = maze->cellSize * 0.5f;
-    const float wallHalfThick = WALL_THICK * 0.5f;
     const float wallHalfHeight = WALL_HEIGHT * 0.5f;
-    
-    Color wallColor = DARKGRAY;
-    Color floorColor = (Color){200, 200, 200, 255};
-    Color ceilingColor = (Color){170, 170, 170, 255};
     
     // Calculate maze bounds for floor/ceiling
     float mazeWidth = maze->width * maze->cellSize;
     float mazeHeight = maze->height * maze->cellSize;
     
-    // Draw floor
-    DrawPlane((Vector3){0, 0, 0}, (Vector2){mazeWidth, mazeHeight}, floorColor);
+    // Draw textured floor
+    DrawTexturedPlane((Vector3){0, 0, 0}, (Vector2){mazeWidth, mazeHeight}, assets->floorTexture);
     
-    // Draw ceiling
-    DrawPlane((Vector3){0, WALL_HEIGHT, 0}, (Vector2){mazeWidth, mazeHeight}, ceilingColor);
+    // Draw textured ceiling
+    DrawTexturedPlane((Vector3){0, WALL_HEIGHT, 0}, (Vector2){mazeWidth, mazeHeight}, assets->ceilingTexture);
     
-    // Draw walls for each cell
+    // Draw textured walls for each cell (texture is batched automatically by DrawTexturedCube)
     for (int y = 0; y < maze->height; y++) {
         for (int x = 0; x < maze->width; x++) {
             float worldX = (x - maze->width * 0.5f + 0.5f) * maze->cellSize;
@@ -121,41 +219,45 @@ static void RenderMaze(const Maze* maze) {
             
             // North wall
             if (Maze_HasWall(maze, x, y, MAZE_NORTH)) {
-                DrawCube((Vector3){
+                DrawTexturedCube((Vector3){
                     worldX,
                     wallHalfHeight,
                     worldZ - halfCell
-                }, maze->cellSize, WALL_HEIGHT, WALL_THICK, wallColor);
+                }, (Vector3){maze->cellSize, WALL_HEIGHT, WALL_THICK}, assets->wallTexture);
             }
             
             // South wall
             if (Maze_HasWall(maze, x, y, MAZE_SOUTH)) {
-                DrawCube((Vector3){
+                DrawTexturedCube((Vector3){
                     worldX,
                     wallHalfHeight,
                     worldZ + halfCell
-                }, maze->cellSize, WALL_HEIGHT, WALL_THICK, wallColor);
+                }, (Vector3){maze->cellSize, WALL_HEIGHT, WALL_THICK}, assets->wallTexture);
             }
             
             // West wall
             if (Maze_HasWall(maze, x, y, MAZE_WEST)) {
-                DrawCube((Vector3){
+                DrawTexturedCube((Vector3){
                     worldX - halfCell,
                     wallHalfHeight,
                     worldZ
-                }, WALL_THICK, WALL_HEIGHT, maze->cellSize, wallColor);
+                }, (Vector3){WALL_THICK, WALL_HEIGHT, maze->cellSize}, assets->wallTexture);
             }
             
             // East wall
             if (Maze_HasWall(maze, x, y, MAZE_EAST)) {
-                DrawCube((Vector3){
+                DrawTexturedCube((Vector3){
                     worldX + halfCell,
                     wallHalfHeight,
                     worldZ
-                }, WALL_THICK, WALL_HEIGHT, maze->cellSize, wallColor);
+                }, (Vector3){WALL_THICK, WALL_HEIGHT, maze->cellSize}, assets->wallTexture);
             }
         }
     }
+    
+    // Reset texture tracking for next frame
+    s_currentCubeTexture.id = 0;
+    s_currentPlaneTexture.id = 0;
     
     // Highlight exit cell (green floor)
     Vector2 exitWorld = Maze_CellToWorld(maze, (int)maze->exitPos.x, (int)maze->exitPos.y);
@@ -199,8 +301,22 @@ int main(void) {
     cam.fovy = 75.0f;
     cam.projection = CAMERA_PERSPECTIVE;
     
+    // Load assets
+    GameAssets* assets = Assets_Load();
+    if (!assets) {
+        TraceLog(LOG_ERROR, "Failed to load assets!");
+        CloseWindow();
+        return 1;
+    }
+    
+    // Torch and particle system state
+    Torch* torches = NULL;
+    int torchCount = 0;
+    ParticleSystem** particleSystems = NULL;
+    
     // Initialize game
-    InitGame(&maze, &walls, &wallCount, &playerPos, &yaw, &pitch, &gameState);
+    InitGame(&maze, &walls, &wallCount, &playerPos, &yaw, &pitch, &gameState,
+             &torches, &torchCount, &particleSystems);
     
     // Main game loop
     while (!WindowShouldClose()) {
@@ -215,7 +331,24 @@ int main(void) {
         
         // Restart game
         if (IsKeyPressed(KEY_R)) {
-            InitGame(&maze, &walls, &wallCount, &playerPos, &yaw, &pitch, &gameState);
+            InitGame(&maze, &walls, &wallCount, &playerPos, &yaw, &pitch, &gameState,
+                     &torches, &torchCount, &particleSystems);
+        }
+        
+        // Update torches
+        if (torches && torchCount > 0) {
+            Torches_Update(torches, torchCount, dt);
+            
+            // Update particle systems
+            if (particleSystems) {
+                for (int i = 0; i < torchCount; i++) {
+                    if (particleSystems[i]) {
+                        Vector3 flamePos = torches[i].position;
+                        flamePos.y += 0.25f; // Offset above torch
+                        ParticleSystem_Update(particleSystems[i], flamePos, dt);
+                    }
+                }
+            }
         }
         
         // --- Mouse look (FPS) ---
@@ -327,9 +460,43 @@ int main(void) {
         
         BeginMode3D(cam);
         
-        // Render maze
+        // Render maze with textures
         if (maze) {
-            RenderMaze(maze);
+            RenderMaze(maze, assets);
+        }
+        
+        // Render torches
+        if (torches && torchCount > 0) {
+            Torches_Render(torches, torchCount);
+            
+            // Render flickering light sources (optimized - using cubes instead of spheres)
+            for (int i = 0; i < torchCount; i++) {
+                float flicker = 0.7f + 0.3f * sinf(torches[i].flickerTime) + 
+                                0.1f * sinf(torches[i].flickerTime * 3.0f);
+                float intensity = torches[i].baseIntensity * flicker;
+                
+                Vector3 lightPos = torches[i].position;
+                lightPos.y += 0.3f;
+                
+                // Draw light glow (using cube for better performance)
+                Color lightColor = (Color){
+                    (unsigned char)(255 * intensity),
+                    (unsigned char)(180 * intensity),
+                    (unsigned char)(100 * intensity),
+                    255
+                };
+                float lightSize = 0.15f * intensity;
+                DrawCube(lightPos, lightSize, lightSize, lightSize, lightColor);
+            }
+            
+            // Render particle systems (flames)
+            if (particleSystems) {
+                for (int i = 0; i < torchCount; i++) {
+                    if (particleSystems[i]) {
+                        ParticleSystem_Render(particleSystems[i]);
+                    }
+                }
+            }
         }
         
         EndMode3D();
@@ -372,6 +539,20 @@ int main(void) {
     // Cleanup
     if (maze) Maze_Destroy(maze);
     if (walls) free(walls);
+    if (torches) free(torches);
+    if (particleSystems) {
+        for (int i = 0; i < torchCount; i++) {
+            if (particleSystems[i]) {
+                ParticleSystem_Destroy(particleSystems[i]);
+            }
+        }
+        free(particleSystems);
+    }
+    if (assets) Assets_Unload(assets);
+    
+    // Cleanup static models
+    CleanupCubeModel();
+    CleanupPlaneModel();
     
     CloseWindow();
     return 0;
